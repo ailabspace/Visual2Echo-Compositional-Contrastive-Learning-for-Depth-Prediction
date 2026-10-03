@@ -14,9 +14,7 @@ Owais Ahmed Malik<sup>2</sup>,
 
 <sup>2</sup>Atlantic Technological University
 
-[![arXiv](https://img.shields.io/badge/arXiv-Paper-b31b1b?logo=arxiv&logoColor=b31b1b)]()
-[![Hugging Face](https://img.shields.io/badge/HuggingFace-Checkpoint-yellow?logo=huggingface&logoColor=yellow)](R)
-
+[![CVF](https://img.shields.io/badge/CVF-Paper-005A9C?logo=ieee&logoColor=white)]([https://openaccess.thecvf.com/](https://openaccess.thecvf.com/content/CVPR2026F/papers/Ismail_Visual2Echo_Compositional_Contrastive_Learning_V2E-CCL_Binaural_Knowledge_Distilled_Network_for_CVPRF_2026_paper.pdf))
 </div>
 
 
@@ -255,4 +253,11 @@ Some codes in this repo are adapted from [VisualEchoes](https://github.com/faceb
 ## Citation
 If you find this work or the code useful in your research, please consider citing our paper:
 ```bibtex
-To  appear
+@InProceedings{Ismail_2026_CVPR,
+    author    = {Ismail, Nazrul and Malik, Owais Ahmed and Hong, Ong Wee},
+    title     = {Visual2Echo Compositional Contrastive Learning (V2E-CCL): Binaural Knowledge Distilled Network for Depth Prediction},
+    booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR) Findings},
+    month     = {June},
+    year      = {2026},
+    pages     = {6019-6028}
+}
