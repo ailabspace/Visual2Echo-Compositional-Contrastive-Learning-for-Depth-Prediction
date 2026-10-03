@@ -14,7 +14,7 @@ Owais Ahmed Malik<sup>2</sup>,
 
 <sup>2</sup>Atlantic Technological University
 
-[![CVF](https://img.shields.io/badge/CVF-Paper-005A9C?logo=ieee&logoColor=white)]([https://openaccess.thecvf.com/](https://openaccess.thecvf.com/content/CVPR2026F/papers/Ismail_Visual2Echo_Compositional_Contrastive_Learning_V2E-CCL_Binaural_Knowledge_Distilled_Network_for_CVPRF_2026_paper.pdf))
+[![CVF](https://img.shields.io/badge/CVF-Paper-005A9C?logo=ieee&logoColor=white)](https://openaccess.thecvf.com/content/CVPR2026F/papers/Ismail_Visual2Echo_Compositional_Contrastive_Learning_V2E-CCL_Binaural_Knowledge_Distilled_Network_for_CVPRF_2026_paper.pdf)
 </div>
 
 
