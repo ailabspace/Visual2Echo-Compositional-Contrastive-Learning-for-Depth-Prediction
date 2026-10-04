@@ -70,7 +70,7 @@ wget http://dl.fbaipublicfiles.com/VisualEchoes/rgb_depth/scene_observations_128
 wget http://dl.fbaipublicfiles.com/VisualEchoes/echoes_navigable.tar.gz
 ```
 
-**MatterportEchoes (MP3D) ** is an extension of existing [matterport3D](https://niessner.github.io/Matterport/) dataset. In order to obtain the raw frames please forward the access request acceptance from the authors of MP3D dataset. 
+**MatterportEchoes (MP3D)** is an extension of existing [matterport3D](https://niessner.github.io/Matterport/) dataset. In order to obtain the raw frames please forward the access request acceptance from the authors of MP3D dataset. 
 
 ### MatterportEchoes (mp3d) — recommended
 - **Images/Depth:** per-scene `.pkl` files organised as `{img_path}/{split}.pkl` (and a `scenes/` sub-directory of per-scene pickles)
