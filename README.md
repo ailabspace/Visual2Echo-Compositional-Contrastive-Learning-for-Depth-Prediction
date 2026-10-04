@@ -4,7 +4,7 @@
   Visual2Echo Compositional Contrastive Learning (V2E-CCL): Binaural Knowledge distilled network for Depth prediction
 </h1>
 
-### CVPR 2026 Findings
+### CVPR 2026 Findings 🇺🇸
 
 <a href="https://ailab.space">Nazrul Ismail</a><sup>1</sup>,
 Owais Ahmed Malik<sup>2</sup>,
