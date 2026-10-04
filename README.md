@@ -17,7 +17,15 @@ Owais Ahmed Malik<sup>2</sup>,
 [![CVF](https://img.shields.io/badge/CVF-Paper-005A9C?logo=ieee&logoColor=white)](https://openaccess.thecvf.com/content/CVPR2026F/papers/Ismail_Visual2Echo_Compositional_Contrastive_Learning_V2E-CCL_Binaural_Knowledge_Distilled_Network_for_CVPRF_2026_paper.pdf)
 </div>
 
+---
 
+<p align="center">
+  <img src="assets/EchoNet - pipeline_final.png" alt="V2E-CCL Overview" width="85%">
+  <br>
+  <em>Overview of the Visual2Echo Compositional Contrastive Learning (V2E-CCL) framework for cross-modal binaural depth prediction.</em>
+</p>
+
+## Abstract
 > Depth estimation from audio is an active area of research with applications in robotics and assistive technologies, yet remains underexplored compared to vision-based approaches. Echo reflections inherently capture physically-grounded information, including object displacement, shape, and material properties. Inspired by biological echolocators like bats, we tackle the challenging problem of estimating depth and material properties using only binaural echoes from single audio chirps. Recent work has addressed audio depth estimation by augmenting other modalities or applying cross-modal knowledge distillation from vision to audio. We propose Visual2Echo Compositional Contrastive Learning (V2E-CCL), a knowledge distillation framework that bridges the visual-auditory domain gap through two key components: a Compositional Embedding (CE) module that refines vision teacher latent features by incorporating audio cues, and a Compositional Contrastive Learning (CCL) module that aligns cross-modal spatial representations in a unified latent space. Extensive evaluation shows our method achieves RMSE improvements of 28\% on the Replica dataset and 48\% on the Matterport3D dataset compared to prior audio-only approaches, while demonstrating consistent gains (14\%) across different teacher architectures including modern foundation models.
 > 
 
