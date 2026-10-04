@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+checkpoint/
+checkpoints_pretrained/
+latents/
+*.h5
+*.pth

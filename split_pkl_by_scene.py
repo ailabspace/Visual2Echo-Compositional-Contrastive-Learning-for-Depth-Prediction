@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""Split a monolithic mp3d split pkl file into per-scene pkl files.
-
-Usage:
-    python3 split_pkl_by_scene.py <split_pkl> <output_dir>
-
-Example:
-    python3 split_pkl_by_scene.py \
-        "/media/nz/My Book1/sem_ad_pc/Moon/visualechoes/mp3d/mp3d_split_wise/val.pkl" \
-        "/media/nz/My Book1/sem_ad_pc/Moon/visualechoes/mp3d/mp3d_split_wise/scenes/val"
-
-The output directory will contain one {scene}.pkl per scene in the input dict.
-Each per-scene pkl is a dict keyed by (loc, ori) tuples (same as data_dict[scene]).
-"""
 
 import sys
 import os

@@ -3,12 +3,20 @@ import numpy as np
 import os
 
 
-def compute_errors(gt, pred, mask=None):
-    """Compute standard depth estimation error metrics."""
+def compute_errors(gt, pred, mask=None, median_scale=False):
     if mask is None:
         mask = gt > 0
     pred = pred[mask]
     gt = gt[mask]
+
+    if pred.size == 0 or gt.size == 0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+    if median_scale:
+        s = np.median(gt) / (np.median(pred) + 1e-8)
+        pred = pred * s
+
+    pred = np.clip(pred, 1e-6, None)
 
     thresh = np.maximum((gt / pred), (pred / gt))
     a1 = (thresh < 1.25).mean()
@@ -33,8 +41,6 @@ def compute_errors(gt, pred, mask=None):
 
 
 class TextWrite(object):
-    """Write values to a CSV/text file."""
-
     def __init__(self, filename):
         self.filename = filename
         self.file = open(self.filename, "w+")

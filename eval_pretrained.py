@@ -1,19 +1,6 @@
-"""Evaluate pretrained audiodepth_replica.pth on the Replica test set.
-
-Usage:
-    python3 eval_pretrained.py \
-        --img_path /path/to/scene_observations_128.pkl \
-        --audio_path /path/to/echoes/echoes_navigable \
-        --metadatapath dataset/metadata/replica \
-        --init_material_weight checkpoints_pretrained/material_pre_trained_minc.pth \
-        --weights checkpoints_pretrained/audiodepth_replica.pth \
-        --max_depth 5
-"""
-
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
-from options.test_options import TestOptions
 from data_loader.audio_visual_dataset import AudioVisualDataset
 from models.models import ModelBuilder
 from util.util import compute_errors
@@ -39,7 +26,6 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Build a minimal opt object that AudioVisualDataset + BaseOptions expect
     class Opt:
         pass
     opt = Opt()
@@ -52,19 +38,23 @@ def main():
     opt.max_depth      = args.max_depth
     opt.enable_img_augmentation = False
     opt.image_transform = True
-    opt.image_resolution = 128
     opt.use_ipd        = False
+    opt.use_ild        = False
+    opt.use_magdiff    = False
+    opt.log_spectrogram = False
+    opt.audio_nfft     = 512
+    opt.audio_win_length = 256
+    opt.no_audio_augment = True
+    opt.use_specaugment = False
     opt.audio_normalize = False
     opt.mode           = args.split
 
-    # Compute audio shape (same formula as base_options.py)
     _sr   = 44100
     _hop  = args.audio_hop_length
     _n_frames = 1 + int(opt.audio_length * _sr) // _hop
     opt.audio_shape         = [2, 257, _n_frames]
     opt.audio_sampling_rate = _sr
 
-    # Load scene splits
     import os
     def _load_scenes(fname):
         with open(fname) as f:
@@ -78,14 +68,12 @@ def main():
     print(f'audio_shape: {opt.audio_shape}')
     print(f'Evaluating on {args.split} split ({len(opt.scenes[args.split])} scenes)')
 
-    # Dataset
     dataset = AudioVisualDataset()
     dataset.initialize(opt)
     loader  = DataLoader(dataset, batch_size=args.batchSize, shuffle=False,
                          num_workers=args.nThreads, pin_memory=True)
     print(f'Dataset size: {len(dataset)} samples')
 
-    # Model
     builder = ModelBuilder()
     net = builder.build_audiodepth(
         audio_shape=opt.audio_shape, backbone='Legacy', mode='base',
@@ -93,7 +81,6 @@ def main():
     )
     net = net.cuda().eval()
 
-    # Eval loop
     all_preds, all_gts = [], []
     with torch.no_grad():
         for i, batch in enumerate(loader):
@@ -101,7 +88,7 @@ def main():
             depth_gt = batch['depth'].cuda()
 
             depth_pred, _ = net(audio)
-            depth_pred = depth_pred * args.max_depth  # sigmoid → metres
+            depth_pred = depth_pred * args.max_depth
             depth_pred = depth_pred.clamp(0, args.max_depth)
 
             all_preds.append(depth_pred.cpu().numpy())
@@ -112,17 +99,14 @@ def main():
     all_preds = np.concatenate(all_preds, axis=0)
     all_gts   = np.concatenate(all_gts, axis=0)
 
-    # compute_errors expects flat arrays
     pred_flat = all_preds.flatten()
     gt_flat   = all_gts.flatten()
-    # Mask zeros in GT (same as test.py)
     valid = gt_flat > 0
     pred_flat = pred_flat[valid]
     gt_flat   = gt_flat[valid]
-    # Clamp GT to max_depth
     gt_flat   = np.clip(gt_flat, 0, args.max_depth)
 
-    abs_rel, rmse, log10, mae, d1, d2, d3 = compute_errors(gt_flat, pred_flat)
+    abs_rel, rmse, d1, d2, d3, log10, mae = compute_errors(gt_flat, pred_flat)
     print('\n=== Results ===')
     print(f'ABS_REL: {abs_rel:.4f}')
     print(f'RMSE:    {rmse:.4f}')

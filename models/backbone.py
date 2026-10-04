@@ -5,8 +5,6 @@ from torchvision.models import resnet18, ResNet18_Weights, ResNet34_Weights
 
 
 class BinauralResNet18(nn.Module):
-    """ResNet-18 backbone adapted for binaural (2-channel) spectrogram input."""
-
     def __init__(self, in_channel=2, pretrained=False):
         super(BinauralResNet18, self).__init__()
         weight = ResNet18_Weights.DEFAULT if pretrained else None
@@ -29,8 +27,6 @@ class BinauralResNet18(nn.Module):
 
 
 class BinauralResNet34(nn.Module):
-    """ResNet-34 backbone adapted for binaural (2-channel) spectrogram input."""
-
     def __init__(self, in_channel=2, pretrained=False):
         super(BinauralResNet34, self).__init__()
         weight = ResNet34_Weights.DEFAULT if pretrained else None

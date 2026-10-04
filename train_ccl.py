@@ -1,646 +1,523 @@
-"""Compositional Contrastive Learning (CCL) training script.
-
-Trains the audio depth estimation network using:
-- Depth supervision (LogDepth / BerHu / SILog)
-- Teacher depth distillation from RGB teacher
-- Material classification distillation
-- Cross-modal contrastive learning (cosine CCL)
-
-Usage:
-    python3 train_ccl.py \
-        --dataset mp3d \
-        --img_path /path/to/mp3d_split_wise \
-        --audio_path /path/to/echoes_navigable \
-        --metadatapath dataset/metadata/mp3d \
-        --init_material_weight checkpoints_pretrained/material_pre_trained_minc.pth \
-        --init_audiodepth_weight checkpoint/ssl_pretrain/mp3d/audiodepth_ssl_pretrained.pth \
-        --batchSize 64 --niter 100 \
-        --lambda_depth 1.0 --lambda_mat 0.7 --lambda_ct 0.05 \
-        --validation_on --exp_name ccl_train
-"""
-
+import contextlib
+import copy
+import gc
+import glob
 import os
-import time
+import random
+
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
-from options.train_options import TrainOptions
-from models.models import ModelBuilder
-from models.audioVisual_model_ccl import AudioVisualModel
-from data_loader.custom_dataset_data_loader import CustomDatasetDataLoader
-from util.util import TextWrite, compute_errors, AverageMeter
 
-import numpy as np
+from data_loader.custom_dataset_data_loader import CustomDatasetDataLoader
 from models import criterion
+from models.audioVisual_model_ccl import AudioVisualModel
+from models.models import ModelBuilder
+from options.train_options import TrainOptions
+from util.util import compute_errors, AverageMeter
 
 
 def freeze_weights(net):
-    for param in net.parameters():
-        param.requires_grad = False
+    for p in net.parameters():
+        p.requires_grad = False
 
 
-def evaluate(trainer, dataset_val, opt, writer, epoch):
-    losses = []
-    errors = []
-    depth_losses = AverageMeter()
-    mat_losses = AverageMeter()
-    losses_ct_ad = AverageMeter()
-    losses_ct_am = AverageMeter()
-    losses_ccl_ad = AverageMeter()
-    losses_ccl_am = AverageMeter()
+def cleanup_old_checkpoints(expr_dir, dataset, keep_last=1):
+    for prefix in ('audiodepth', 'ccl_audiodepth', 'ccl_audiomat'):
+        files = sorted(glob.glob(os.path.join(expr_dir, f'{prefix}_{dataset}_epoch_*.pth')),
+                       key=lambda p: int(p.rsplit('_epoch_', 1)[-1][:-4]))
+        for f in files[:-keep_last]:
+            os.remove(f)
 
+
+def info_nce(s, t, tau):
+    logits = s @ t.T / tau
+    y = torch.arange(s.shape[0], device=s.device)
+    return 0.5 * (F.cross_entropy(logits, y) + F.cross_entropy(logits.T, y))
+
+
+def evaluate(trainer, loader, opt, writer, step, max_batches=None):
+    losses, errors = [], []
+    depth_losses, mat_losses = AverageMeter(), AverageMeter()
+    ccl_ad, ccl_am = AverageMeter(), AverageMeter()
+    median_scale = 'batvision' in opt.dataset
     with torch.no_grad():
-        for i, val_data in enumerate(dataset_val):
-            output, losses_val = trainer.forward(val_data)
-            _, depth_loss, mat_loss, ccl_audiodepth_loss, ccl_audiomat_loss, \
-                loss_ct_ad, loss_ct_am, _ = losses_val
-
+        for i, data in enumerate(loader):
+            if max_batches and i >= max_batches:
+                break
+            output, l = trainer.forward(data)
+            _, depth_loss, mat_loss, l_ccl_ad, l_ccl_am = l[:5]
             depth_losses.update(depth_loss, opt.batchSize)
             mat_losses.update(mat_loss, opt.batchSize)
-
-            total_loss = (trainer.lambda_depth * depth_loss) + (trainer.lambda_mat * mat_loss)
-            losses.append(total_loss.item())
-
-            losses_ct_ad.update(loss_ct_ad.item(), opt.batchSize)
-            losses_ct_am.update(loss_ct_am.item(), opt.batchSize)
-            losses_ccl_ad.update(ccl_audiodepth_loss.item(), opt.batchSize)
-            losses_ccl_am.update(ccl_audiomat_loss.item(), opt.batchSize)
-
-            depth_gt_val = output["depth_gt"].float()
-            audio_depth_val = output["audio_depth"].float()
-            for idx in range(audio_depth_val.shape[0]):
-                mask = ((depth_gt_val[idx] > 0) &
-                        (depth_gt_val[idx] < opt.max_depth)).cpu().numpy()
-                errors.append(compute_errors(
-                    depth_gt_val[idx].cpu().numpy(),
-                    audio_depth_val[idx].cpu().numpy(), mask=mask))
+            ccl_ad.update(l_ccl_ad, opt.batchSize)
+            ccl_am.update(l_ccl_am, opt.batchSize)
+            losses.append(trainer.lambda_depth * depth_loss + trainer.lambda_mat * mat_loss)
+            gt = output['depth_gt'].float().cpu().numpy()
+            pred = output['audio_depth'].float().cpu().numpy()
+            for b in range(pred.shape[0]):
+                mask = (gt[b] > 0) & (gt[b] < opt.max_depth)
+                errors.append(compute_errors(gt[b], pred[b], mask=mask, median_scale=median_scale))
 
     mean_loss = sum(losses) / len(losses)
-    mean_errors = np.array(errors).mean(0)
-
+    e = np.array(errors).mean(0)
     print('Loss: {:.3f}, RMSE: {:.3f}, delta1: {:.3f}, delta2: {:.3f}, delta3: {:.3f}'.format(
-        mean_loss, mean_errors[1], mean_errors[2], mean_errors[3], mean_errors[4]))
+        mean_loss, e[1], e[2], e[3], e[4]))
+    val_errors = {'ABS_REL': e[0], 'RMSE': e[1], 'DELTA1': e[2], 'DELTA2': e[3], 'DELTA3': e[4]}
 
-    val_errors = {
-        'ABS_REL/STD': mean_errors[0],
-        'RMSE/STD': mean_errors[1],
-        'DELTA1/STD': mean_errors[2],
-        'DELTA2/STD': mean_errors[3],
-        'DELTA3/STD': mean_errors[4],
-    }
+    n = opt.val_split_n
+    if n > 0 and len(errors) > n:
+        ev, et = np.array(errors[:n]).mean(0), np.array(errors[n:]).mean(0)
+        print('[split] val n={} abs_rel {:.4f} rmse {:.4f} d1 {:.4f} | test n={} abs_rel {:.4f} rmse {:.4f} d1 {:.4f}'.format(
+            n, ev[0], ev[1], ev[2], len(errors) - n, et[0], et[1], et[2]))
+        val_errors['RMSE_VALONLY'] = ev[1]
+        writer.add_scalar('val_only/RMSE', ev[1], step)
+        writer.add_scalar('val_only/ABS_REL', ev[0], step)
+        writer.add_scalar('test_only/RMSE', et[1], step)
+        writer.add_scalar('test_only/ABS_REL', et[0], step)
 
-    if writer:
-        writer.add_images('val/audio_pred_depth', output["audio_depth"], epoch, dataformats="NCHW")
-        if output["img_depth"] is not None:
-            writer.add_images('val/rgb_pred_depth', output["img_depth"], epoch, dataformats="NCHW")
-        writer.add_images('val/depth_gt', output["depth_gt"], epoch, dataformats="NCHW")
-        writer.add_scalar('val/mat_loss', mat_losses.avg, epoch)
-        writer.add_scalar('val/depth_loss', depth_losses.avg, epoch)
-        writer.add_scalar('val/ccl_audiomat_loss', losses_ccl_am.avg, epoch)
-        writer.add_scalar('val/ccl_audiodepth_loss', losses_ccl_ad.avg, epoch)
-
+    writer.add_scalar('val/mat_loss', mat_losses.avg, step)
+    writer.add_scalar('val/depth_loss', depth_losses.avg, step)
+    writer.add_scalar('val/ccl_audiomat_loss', ccl_am.avg, step)
+    writer.add_scalar('val/ccl_audiodepth_loss', ccl_ad.avg, step)
     return mean_loss, val_errors
 
 
-# ---------------------------------------------------------------------------
-# Trainer
-# ---------------------------------------------------------------------------
-
 class Trainer:
-    def __init__(self, nets, opt, augment=False):
-        self.nets = nets
-        self.model = AudioVisualModel(self.nets, opt)
-
-        if len(opt.gpu_ids) > 1:
-            self.model = torch.nn.DataParallel(self.model, device_ids=opt.gpu_ids)
-        self.model.to(opt.device)
-
+    def __init__(self, nets, opt):
         self.opt = opt
-        self.augment = augment
+        self.model = AudioVisualModel(nets, opt).to(opt.device)
+        m = self.model
 
-        # Loss weights
-        self.lambda_depth = getattr(opt, 'lambda_depth', 1.0)
-        self.lambda_mat = getattr(opt, 'lambda_mat', 0.)
-        self.lambda_ccl_depth = getattr(opt, 'lambda_ccl_depth', 0.)
-        self.lambda_ccl_mat = 0.
-        self.lambda_ccl = max(self.lambda_ccl_depth, self.lambda_ccl_mat)
-        self.lambda_ct = getattr(opt, 'lambda_ct', 0.)
-        self.lambda_tv = 0.0
-        self.lambda_multiscale = getattr(opt, 'lambda_multiscale', 0.0)
-        self.lambda_laplacian = getattr(opt, 'lambda_laplacian', 0.0)
-        self.lambda_ssim = getattr(opt, 'lambda_ssim', 0.0)
-        self.lambda_grad = getattr(opt, 'lambda_grad', 0.0)
-        self.lambda_teacher_depth = getattr(opt, 'lambda_teacher_depth', 0.25)
+        self.lambda_depth = opt.lambda_depth
+        self.lambda_mat = opt.lambda_mat
+        self.lambda_ccl_depth = opt.lambda_ccl_depth
+        self.lambda_ccl_mat = opt.lambda_ccl_mat
+        self.lambda_ct = opt.lambda_ct
+        self.lambda_teacher_depth = opt.lambda_teacher_depth
+        self.lambda_ldc = opt.lambda_ldc
+        self.lambda_cc = opt.lambda_cc
+        self.lambda_multiscale = opt.lambda_multiscale
+        self.lambda_laplacian = opt.lambda_laplacian
+        self.lambda_ssim = opt.lambda_ssim
+        self.lambda_grad = opt.lambda_grad
+        self.lambda_feat_std = opt.lambda_feat_std
+        if opt.lambda_depth == 0 and opt.mode == 'train':
+            raise ValueError('--lambda_depth 0 leaves the depth head unsupervised')
 
-        if self.lambda_laplacian > 0:
-            self.laplacian_loss = criterion.LaplacianDepthLoss(max_depth=opt.max_depth)
+        md = opt.max_depth
+        self.loss_criterion = {
+            'silog': lambda: criterion.SILogLoss(scaling_factor=1.0, max_depth=md),
+            'l1': criterion.L1Loss,
+            'l2': criterion.L2Loss,
+            'berhu': lambda: criterion.Berhuloss(threshold=opt.berhu_threshold, max_depth=md),
+        }.get(opt.depth_loss_type, lambda: criterion.LogDepthLoss(max_depth=md))()
+        self.laplacian_loss = criterion.LaplacianDepthLoss(max_depth=md) if self.lambda_laplacian > 0 else None
+        self.ssim_loss = criterion.SSIMLoss() if self.lambda_ssim > 0 else None
+        self.feat_std_hinge = criterion.FeatureStdHinge(gamma=opt.feat_std_gamma) if self.lambda_feat_std > 0 else None
+        self.mat_criterion = criterion.DistillationLoss()
+        if opt.ccl_depth_loss == 'berhu':
+            self.ccl_audiodepth_criterion = criterion.Berhuloss(threshold=0.2, max_depth=md)
         else:
-            self.laplacian_loss = None
-        if self.lambda_ssim > 0:
-            self.ssim_loss = criterion.SSIMLoss()
+            self.ccl_audiodepth_criterion = criterion.LogDepthLoss(zero_depth_weight=0.9, max_depth=md)
+        self.ct_am_criterion = criterion.CosineCCLLoss(temperature=opt.ccl_temperature)
+        if opt.ct_ad_loss == 'infonce':
+            self.ct_ad_criterion = criterion.ContrastiveLoss(temperature=opt.ct_temperature)
         else:
-            self.ssim_loss = None
+            self.ct_ad_criterion = criterion.CosineCCLLoss(temperature=opt.ccl_temperature)
 
-        # Loss functions
-        _max_depth = opt.max_depth
-        _depth_loss_type = getattr(opt, 'depth_loss_type', 'log')
-        if _depth_loss_type == 'silog':
-            self.loss_criterion = criterion.SILogLoss(scaling_factor=1.0, max_depth=_max_depth)
-        elif _depth_loss_type == 'l1':
-            self.loss_criterion = criterion.L1Loss()
-        elif _depth_loss_type == 'l2':
-            self.loss_criterion = criterion.L2Loss()
-        elif _depth_loss_type == 'berhu':
-            self.loss_criterion = criterion.Berhuloss(
-                threshold=getattr(opt, 'berhu_threshold', 0.2), max_depth=_max_depth)
+        backbone = list(m.net_audio.feature_extraction.parameters()) \
+            if hasattr(m.net_audio, 'feature_extraction') else []
+        ids = set(id(p) for p in backbone)
+        other = [p for p in m.parameters() if p.requires_grad and id(p) not in ids]
+        groups = [{'params': backbone, 'lr': opt.lr_backbone_main, 'name': 'audio_backbone'},
+                  {'params': other, 'lr': opt.lr_audio, 'name': 'other'}]
+        if opt.optimizer == 'sgd':
+            self.optimizer = torch.optim.SGD(groups, momentum=opt.beta1, weight_decay=opt.weight_decay)
         else:
-            self.loss_criterion = criterion.LogDepthLoss(max_depth=_max_depth)
+            self.optimizer = torch.optim.Adam(groups, betas=(opt.beta1, 0.999), weight_decay=opt.weight_decay)
 
-        self.loss_mat_criterion = criterion.DistillationLoss()
-        self.ccl_audiomat_criterion = criterion.DistillationLoss()
-
-        _ccl_depth_loss = getattr(opt, 'ccl_depth_loss', 'log')
-        if _ccl_depth_loss == 'berhu':
-            self.ccl_audiodepth_criterion = criterion.Berhuloss(
-                threshold=0.2, max_depth=_max_depth)
-        else:
-            self.ccl_audiodepth_criterion = criterion.LogDepthLoss(
-                zero_depth_weight=0.9, max_depth=_max_depth)
-
-        _ccl_temp = getattr(opt, 'ccl_temperature', 1.0)
-        self.criterion_ccl_cosine = criterion.CosineCCLLoss(temperature=_ccl_temp)
-        self.criterion_ct_am = criterion.NCELoss(temperature=1., head='MatNet')
-        self.criterion_ct_ad = criterion.CosineCCLLoss(temperature=_ccl_temp)
-
-        self.optimizer = self._create_optimizer()
-        self._use_fp16 = getattr(opt, 'use_fp16', False)
-        if self._use_fp16:
-            self.scaler = torch.cuda.amp.GradScaler()
-        self._accum_steps = max(1, getattr(opt, 'accumulation_steps', 1))
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=opt.cosine_T_max, eta_min=1e-6) if opt.cosine_T_max > 0 else None
+        self.warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            self.optimizer, start_factor=0.1, end_factor=1.0,
+            total_iters=opt.warmup_steps) if opt.warmup_steps > 0 else None
+        self._warmup_count = 0
+        self._accum_steps = max(1, opt.accumulation_steps)
         self._accum_step = 0
 
-        # LR scheduling
-        _cosine_steps = getattr(opt, 'cosine_T_max', 0)
-        _plateau_factor = getattr(opt, 'lr_plateau_factor', 0.0)
-        if _plateau_factor > 0:
-            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                self.optimizer, mode='min', factor=_plateau_factor,
-                patience=getattr(opt, 'lr_plateau_patience', 5), min_lr=1e-7, verbose=True)
-            self._plateau_scheduler = True
-        elif _cosine_steps > 0:
-            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=_cosine_steps, eta_min=1e-6)
-            self._plateau_scheduler = False
-        else:
-            self.scheduler = None
-            self._plateau_scheduler = False
-
-        _warmup_steps = getattr(opt, 'warmup_steps', 0)
-        if _warmup_steps > 0:
-            self.warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-                self.optimizer, start_factor=0.1, end_factor=1.0, total_iters=_warmup_steps)
-        else:
-            self.warmup_scheduler = None
-        self._warmup_step_count = 0
-        self._warmup_steps = _warmup_steps
-
-        # EMA
-        _ema_decay = getattr(opt, 'ema_decay', 0.0)
-        self.ema_decay = _ema_decay
-        if _ema_decay > 0:
-            import copy
-            self.ema_net = copy.deepcopy(self._student_net().net_audio)
+        self.ema_decay = opt.ema_decay
+        self.ema_net = None
+        if self.ema_decay > 0:
+            self.ema_net = copy.deepcopy(m.net_audio)
             for p in self.ema_net.parameters():
                 p.requires_grad_(False)
-        else:
-            self.ema_net = None
 
-        m = self._student_net()
-        if getattr(opt, 'teacher_cache_path', ''):
-            m.net_rgbdepth.cpu()
+        if opt.teacher_cache_path:
+            if opt.rgb_teacher != 'moge_v2':
+                m.net_rgbdepth.cpu()
+            elif opt.cache_freeze_teacher_proj and opt.freeze_nets:
+                freeze_weights(m.net_rgbdepth)
             m.net_material.cpu()
         torch.cuda.empty_cache()
+        self._zero = torch.zeros(1, device=opt.device)
+        self.last = {}
 
-    def _create_optimizer(self):
-        m = self._student_net()
-        backbone_params = list(m.net_audio.feature_extraction.parameters())
-        backbone_ids = set(id(p) for p in backbone_params)
-        other_params = [p for p in self.model.parameters()
-                        if p.requires_grad and id(p) not in backbone_ids]
-        lr_bb = getattr(self.opt, 'lr_backbone_main', self.opt.lr_audio * 0.1)
-        param_groups = [
-            {'params': backbone_params, 'lr': lr_bb},
-            {'params': other_params, 'lr': self.opt.lr_audio},
-        ]
-        if self.opt.optimizer == 'sgd':
-            return torch.optim.SGD(param_groups, momentum=self.opt.beta1,
-                                   weight_decay=self.opt.weight_decay)
-        return torch.optim.Adam(param_groups, betas=(self.opt.beta1, 0.999),
-                                weight_decay=self.opt.weight_decay)
+    @contextlib.contextmanager
+    def swap_ema(self):
+        if self.ema_net is None:
+            yield
+            return
+        net = self.model.net_audio
+        live = copy.deepcopy(net.state_dict())
+        net.load_state_dict(self.ema_net.state_dict())
+        try:
+            yield
+        finally:
+            net.load_state_dict(live)
 
     def decrease_learning_rate(self, decay_factor=0.94):
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] *= decay_factor
-
-    def swap_ema(self):
-        import contextlib
-
-        @contextlib.contextmanager
-        def _ctx():
-            if self.ema_net is None:
-                yield
-                return
-            net = self._student_net().net_audio
-            import copy
-            live_state = copy.deepcopy(net.state_dict())
-            net.load_state_dict(self.ema_net.state_dict())
-            try:
-                yield
-            finally:
-                net.load_state_dict(live_state)
-        return _ctx()
-
-    def _student_net(self):
-        return self.model.module if hasattr(self.model, 'module') else self.model
-
-    def _to_device(self, data):
-        return {k: v.to(self.opt.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
-                for k, v in data.items()}
+        for g in self.optimizer.param_groups:
+            g['lr'] *= decay_factor
 
     def forward(self, data):
-        data = self._to_device(data)
-        _zero = torch.zeros(1, device=self.opt.device)
+        opt, zero = self.opt, self._zero
+        data = {k: v.to(opt.device, non_blocking=True) if torch.is_tensor(v) else v for k, v in data.items()}
+        compute_ccl = max(self.lambda_ccl_depth, self.lambda_ccl_mat) != 0
+        compute_ct = self.lambda_ct != 0
+        output = self.model(data, compute_ccl=compute_ccl, compute_ct=compute_ct)
 
-        compute_ccl = (self.lambda_ccl != 0.0)
-        compute_ct = (self.lambda_ct != 0.0)
+        gt = output['depth_gt']
+        pred = output['audio_depth']
+        depth_loss = self.loss_criterion(pred, gt)
+        mat_loss = self.mat_criterion([output['audio_mat_class'], output['material_class']], None) \
+            if self.lambda_mat != 0 and output['audio_mat_class'] is not None else zero
 
-        output = self.model.forward(data, compute_ccl=compute_ccl, compute_ct=compute_ct)
-
-        depth_gt = output['depth_gt']
-        depth_predicted = output['audio_depth']
-        audio_mat_class = output['audio_mat_class']
-        material_class = output['material_class']
-        audio_feat = output['audio_feat']
-        material_feat = output['material_feat']
-
-        depth_loss = self.loss_criterion(depth_predicted, depth_gt)
-        mat_loss = (self.loss_mat_criterion([audio_mat_class, material_class], None)
-                    if self.lambda_mat != 0.0 else _zero)
-
-        # Teacher depth distillation
         img_depth = output['img_depth']
-        if self.lambda_teacher_depth > 0.0 and img_depth is not None:
-            valid_mask = (depth_gt > 0) & (depth_gt < self.opt.max_depth)
-            if valid_mask.any():
-                if getattr(self.opt, 'berhu_teacher', False):
-                    teacher_depth_loss = self.loss_criterion(
-                        depth_predicted * valid_mask.float(),
-                        img_depth.detach() * valid_mask.float())
+        td_loss = zero
+        if self.lambda_teacher_depth > 0 and img_depth is not None:
+            if img_depth.shape[-2:] != pred.shape[-2:]:
+                img_depth = F.interpolate(img_depth.float(), size=pred.shape[-2:], mode='bilinear', align_corners=False)
+            valid = (gt > 0) & (gt < opt.max_depth)
+            if valid.any() and opt.teacher_depth_align:
+                t = img_depth.detach().float().clone()
+                for b in range(t.shape[0]):
+                    mb = valid[b] & (t[b] > 1e-3)
+                    if mb.sum() >= 50:
+                        t[b] = t[b] * (gt[b][mb].median() / t[b][mb].median().clamp_min(1e-3))
+                t = torch.where(valid, t.clamp(0, opt.max_depth), torch.zeros_like(t))
+                td_loss = self.loss_criterion(pred, t)
+            elif valid.any():
+                if opt.berhu_teacher:
+                    td_loss = self.loss_criterion(pred * valid.float(), img_depth.detach() * valid.float())
                 else:
-                    teacher_depth_loss = F.smooth_l1_loss(
-                        depth_predicted[valid_mask], img_depth.detach()[valid_mask])
-            else:
-                teacher_depth_loss = _zero
-        else:
-            teacher_depth_loss = _zero
+                    td_loss = F.smooth_l1_loss(pred[valid], img_depth.detach()[valid])
 
-        # CCL losses
         if compute_ccl:
-            ccl_audiodepth = output['ccl_audiodepth']
-            ccl_audiomat = output['ccl_audiomat']
-            ccl_audiodepth_loss = (self.ccl_audiodepth_criterion(ccl_audiodepth, depth_gt)
-                                   if ccl_audiodepth is not None else _zero)
-            ccl_audiomat_loss = self.ccl_audiomat_criterion(
-                [ccl_audiomat, material_class], None)
+            ccl_ad_loss = self.ccl_audiodepth_criterion(output['ccl_audiodepth'], gt) \
+                if output['ccl_audiodepth'] is not None else zero
+            ccl_am_loss = self.mat_criterion([output['ccl_audiomat'], output['material_class']], None)
         else:
-            ccl_audiodepth_loss = ccl_audiomat_loss = _zero
+            ccl_ad_loss = ccl_am_loss = zero
 
-        # Contrastive losses
         if compute_ct:
-            aud_proj_feat = output['aud_proj_feat']
-            img_proj_feat = output['img_proj_feat']
-            loss_ct_ad = self.criterion_ct_ad(aud_proj_feat, img_proj_feat)
-            af = F.adaptive_avg_pool2d(audio_feat.detach(), (1, 1)).flatten(1)
-            mf = F.adaptive_avg_pool2d(material_feat, (1, 1)).flatten(1)
-            loss_ct_am = self.criterion_ccl_cosine(af, mf)
+            ct_ad_loss = self.ct_ad_criterion(output['aud_proj_feat'], output['img_proj_feat'])
+            ct_am_loss = opt.ct_am_scale * self.ct_am_criterion(
+                output['audio_feat'].mean((2, 3)), output['material_feat'].detach().mean((2, 3)))
         else:
-            loss_ct_am = loss_ct_ad = _zero
+            ct_ad_loss = ct_am_loss = zero
 
-        # Aggregate losses
-        total_ccl_loss = (self.lambda_ccl_depth * ccl_audiodepth_loss +
-                          self.lambda_ccl_mat * ccl_audiomat_loss)
-        total_ct_loss = self.lambda_ct * (loss_ct_ad + loss_ct_am)
+        ldc_loss = zero
+        if self.lambda_ldc > 0 and output['ldc_emb'] is not None and output['img_depth'] is not None \
+                and output['ldc_emb'].shape[0] > 2:
+            with torch.no_grad():
+                lt = torch.log(output['img_depth'].float().clamp(0.1, opt.max_depth))
+                lt = F.adaptive_avg_pool2d(lt, opt.ldc_grid).flatten(1)
+                lt = F.normalize(lt - lt.mean(0, keepdim=True), dim=1)
+            ldc_loss = info_nce(F.normalize(output['ldc_emb'].float(), dim=1), lt, opt.ldc_tau)
 
-        # TV smoothness
-        if self.lambda_tv > 0 and depth_predicted is not None:
-            diff_x = torch.abs(depth_predicted[:, :, :, 1:] - depth_predicted[:, :, :, :-1])
-            diff_y = torch.abs(depth_predicted[:, :, 1:, :] - depth_predicted[:, :, :-1, :])
-            tv_loss = diff_x.mean() + diff_y.mean()
-        else:
-            tv_loss = _zero
+        cc_loss = zero
+        if self.lambda_cc > 0 and output['cc_emb'] is not None and output['ccl_audiodepth_feat'] is not None \
+                and output['cc_emb'].shape[0] > 2:
+            with torch.no_grad():
+                ct = F.adaptive_avg_pool2d(output['ccl_audiodepth_feat'].detach().float(), 4).flatten(1)
+                ct = F.normalize(ct - ct.mean(0, keepdim=True), dim=1)
+            cc_loss = info_nce(F.normalize(output['cc_emb'].float(), dim=1), ct, opt.cc_tau)
 
-        # Multi-scale depth loss
-        if self.lambda_multiscale > 0 and depth_predicted is not None:
-            ms_loss = _zero
-            for scale in [2, 4]:
-                ds_pred = F.avg_pool2d(depth_predicted, scale, stride=scale)
-                ds_gt = F.avg_pool2d(depth_gt, scale, stride=scale)
-                ms_loss = ms_loss + self.loss_criterion(ds_pred, ds_gt)
-            multiscale_depth_loss = self.lambda_multiscale * ms_loss
-        else:
-            multiscale_depth_loss = _zero
+        total_ccl = self.lambda_ccl_depth * ccl_ad_loss + self.lambda_ccl_mat * ccl_am_loss
+        total_ct = self.lambda_ct * (ct_ad_loss + ct_am_loss)
 
-        # Laplacian edge-aware loss
-        if self.lambda_laplacian > 0 and self.laplacian_loss is not None:
-            lap_loss = self.lambda_laplacian * self.laplacian_loss(depth_predicted, depth_gt)
-        else:
-            lap_loss = _zero
-
-        ssim_loss_val = (self.ssim_loss(depth_predicted, depth_gt)
-                         if self.ssim_loss is not None else _zero)
-
+        ms_loss = zero
+        if self.lambda_multiscale > 0:
+            for s in (2, 4):
+                ms_loss = ms_loss + self.loss_criterion(F.avg_pool2d(pred, s, stride=s), F.avg_pool2d(gt, s, stride=s))
+            ms_loss = self.lambda_multiscale * ms_loss
+        lap_loss = self.lambda_laplacian * self.laplacian_loss(pred, gt) if self.laplacian_loss is not None else zero
+        ssim_loss = self.ssim_loss(pred, gt) if self.ssim_loss is not None else zero
+        grad_loss = zero
         if self.lambda_grad > 0:
-            dx_pred = depth_predicted[:, :, :, 1:] - depth_predicted[:, :, :, :-1]
-            dy_pred = depth_predicted[:, :, 1:, :] - depth_predicted[:, :, :-1, :]
-            dx_gt = depth_gt[:, :, :, 1:] - depth_gt[:, :, :, :-1]
-            dy_gt = depth_gt[:, :, 1:, :] - depth_gt[:, :, :-1, :]
-            grad_loss_val = F.smooth_l1_loss(dx_pred, dx_gt) + F.smooth_l1_loss(dy_pred, dy_gt)
-        else:
-            grad_loss_val = _zero
+            grad_loss = (F.smooth_l1_loss(pred[..., 1:] - pred[..., :-1], gt[..., 1:] - gt[..., :-1])
+                         + F.smooth_l1_loss(pred[..., 1:, :] - pred[..., :-1, :], gt[..., 1:, :] - gt[..., :-1, :]))
+        feat_std_loss = self.feat_std_hinge(output['audio_feat']) if self.feat_std_hinge is not None else zero
 
-        total_loss = (self.lambda_depth * depth_loss
+        total_loss = (self.lambda_feat_std * feat_std_loss
+                      + self.lambda_depth * depth_loss
                       + self.lambda_mat * mat_loss
-                      + total_ct_loss + total_ccl_loss
-                      + self.lambda_tv * tv_loss
-                      + self.lambda_teacher_depth * teacher_depth_loss
-                      + multiscale_depth_loss + lap_loss
-                      + self.lambda_ssim * ssim_loss_val
-                      + self.lambda_grad * grad_loss_val)
+                      + total_ct + total_ccl
+                      + self.lambda_ldc * ldc_loss
+                      + self.lambda_cc * cc_loss
+                      + self.lambda_teacher_depth * td_loss
+                      + ms_loss + lap_loss
+                      + self.lambda_ssim * ssim_loss
+                      + self.lambda_grad * grad_loss)
 
-        if self.opt.mode == "train":
+        self.last = {'ldc': float(ldc_loss), 'cc': float(cc_loss), 'feat_std': float(feat_std_loss)}
+        if opt.mode == 'train':
+            m = self.model
             if self._accum_step == 0:
                 self.optimizer.zero_grad()
-
-            if self._use_fp16:
-                self.scaler.scale(total_loss / self._accum_steps).backward()
-            else:
-                (total_loss / self._accum_steps).backward()
+            (total_loss / self._accum_steps).backward()
             self._accum_step += 1
+            if self._accum_step < self._accum_steps:
+                return output, self._losses(total_loss, depth_loss, mat_loss, ccl_ad_loss, ccl_am_loss,
+                                            ct_ad_loss, ct_am_loss, td_loss)
+            self._accum_step = 0
+            for net in (m.net_audio, m.ccl_audiomat, m.ccl_audiodepth, m.img_proj, m.aud_proj):
+                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+            self.optimizer.step()
+            if self.warmup_scheduler is not None and self._warmup_count < opt.warmup_steps:
+                self.warmup_scheduler.step()
+                self._warmup_count += 1
+            elif self.scheduler is not None:
+                self.scheduler.step()
+            if self.ema_net is not None:
+                with torch.no_grad():
+                    for e, s in zip(self.ema_net.parameters(), m.net_audio.parameters()):
+                        e.mul_(self.ema_decay).add_(s, alpha=1 - self.ema_decay)
+                    for e, s in zip(self.ema_net.buffers(), m.net_audio.buffers()):
+                        e.copy_(s)
 
-            if self._accum_step >= self._accum_steps:
-                m = self._student_net()
-                if self._use_fp16:
-                    self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(m.net_audio.parameters(), max_norm=1.0)
-                torch.nn.utils.clip_grad_norm_(m.ccl_audiomat.parameters(), max_norm=1.0)
-                torch.nn.utils.clip_grad_norm_(m.ccl_audiodepth.parameters(), max_norm=1.0)
-                torch.nn.utils.clip_grad_norm_(m.img_proj.parameters(), max_norm=1.0)
-                torch.nn.utils.clip_grad_norm_(m.aud_proj.parameters(), max_norm=1.0)
-                if self._use_fp16:
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    self.optimizer.step()
-                if self.warmup_scheduler is not None and self._warmup_step_count < self._warmup_steps:
-                    self.warmup_scheduler.step()
-                    self._warmup_step_count += 1
-                elif self.scheduler is not None and not self._plateau_scheduler:
-                    self.scheduler.step()
-                # EMA update
-                if self.ema_net is not None:
-                    with torch.no_grad():
-                        src = self._student_net().net_audio
-                        for ema_p, src_p in zip(self.ema_net.parameters(), src.parameters()):
-                            ema_p.mul_(self.ema_decay).add_(src_p, alpha=1 - self.ema_decay)
-                        for ema_b, src_b in zip(self.ema_net.buffers(), src.buffers()):
-                            ema_b.copy_(src_b)
-                self._accum_step = 0
+        return output, self._losses(total_loss, depth_loss, mat_loss, ccl_ad_loss, ccl_am_loss,
+                                    ct_ad_loss, ct_am_loss, td_loss)
 
-        losses = [total_loss.item(), depth_loss, mat_loss,
-                  ccl_audiodepth_loss, ccl_audiomat_loss, loss_ct_ad, loss_ct_am,
-                  teacher_depth_loss]
-        return output, losses
+    @staticmethod
+    def _losses(*terms):
+        return [t.item() for t in terms]
 
 
-# ---------------------------------------------------------------------------
-# Main training script
-# ---------------------------------------------------------------------------
+def save_nets(opt, suffix, audio_net, ccl_ad, ccl_am):
+    torch.save(audio_net.state_dict(), os.path.join(opt.expr_dir, f'audiodepth_{opt.dataset}{suffix}.pth'))
+    torch.save(ccl_ad.state_dict(), os.path.join(opt.expr_dir, f'ccl_audiodepth_{opt.dataset}{suffix}.pth'))
+    torch.save(ccl_am.state_dict(), os.path.join(opt.expr_dir, f'ccl_audiomat_{opt.dataset}{suffix}.pth'))
+
 
 opt = TrainOptions().parse()
-opt.device = torch.device("cuda")
+opt.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-_seed = getattr(opt, 'seed', 0)
-if _seed > 0:
-    torch.manual_seed(_seed)
-    np.random.seed(_seed)
-    torch.cuda.manual_seed_all(_seed)
+if opt.seed > 0:
+    random.seed(opt.seed)
+    torch.manual_seed(opt.seed)
+    np.random.seed(opt.seed)
+    torch.cuda.manual_seed_all(opt.seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+else:
+    print('[WARN] --seed 0: run is unseeded')
+if opt.deterministic:
+    os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
-if getattr(opt, 'detect_anomaly', False):
-    torch.autograd.set_detect_anomaly(True)
-    print("[WARN] Anomaly detection ON (slow).")
+teacher_cache_path = opt.teacher_cache_path or None
+validation_cache_path = opt.validation_cache_path or None
+material_cache_path = opt.material_cache_path or None
+if material_cache_path and not teacher_cache_path:
+    raise ValueError('--material_cache_path needs --teacher_cache_path')
 
-teacher_cache_path = opt.teacher_cache_path if opt.teacher_cache_path else None
-validation_cache_path = opt.validation_cache_path if opt.validation_cache_path else None
-
-writer = SummaryWriter(os.path.join("runs", opt.exp_name))
-train_loss_file = TextWrite(os.path.join(opt.expr_dir, 'train_loss.csv'))
-train_loss_file.add_line_csv(['step', 'loss'])
-train_loss_file.write_line()
-
-val_loss_file = TextWrite(os.path.join(opt.expr_dir, 'val_loss.csv'))
-val_loss_file.add_line_csv(['step', 'loss'])
-val_loss_file.write_line()
-
-val_error_file = TextWrite(os.path.join(opt.expr_dir, 'val_error.csv'))
-val_error_file.add_line_csv(['step', 'RMSE', 'ABS_REL', 'DELTA1', 'DELTA2', 'DELTA3'])
-val_error_file.write_line()
+writer = SummaryWriter(os.path.join('runs', opt.exp_name))
+builder = ModelBuilder()
+audiodepth_kwargs = dict(
+    use_se_skips=opt.use_se_skips,
+    decoder_spatial_entry=opt.decoder_spatial_entry,
+    use_silu=opt.use_silu,
+    use_residual_decoder=opt.use_residual_decoder,
+    wider_decoder=opt.wider_decoder,
+    use_log_depth=opt.use_log_depth,
+    max_depth=float(opt.max_depth),
+    decoder_dropout=opt.audio_decoder_dropout if opt.audio_decoder_dropout >= 0 else 0.1,
+    target_hw=tuple(int(x) for x in opt.depth_target_hw.split(',')),
+    audio_norm_type=opt.audio_norm_type,
+    audio_norm_groups=opt.audio_norm_groups,
+    mat_nclass=opt.mat_nclass,
+)
+rgbdepth_kwargs = dict(
+    teacher=opt.rgb_teacher,
+    teacher_max_depth=float(opt.max_depth),
+    moge_model_id=opt.moge_model_id,
+    moge_num_tokens=opt.moge_num_tokens or None,
+    moge_resolution_level=opt.moge_resolution_level,
+)
+rgb_weights = os.path.join('checkpoints_pretrained', f'rgbdepth_{opt.dataset}.pth')
 
 ep_init = 0
-
-# Build networks
-builder = ModelBuilder()
-if opt.resume_dir and opt.last_epoch:
+if opt.resume_dir and opt.last_epoch is not None:
     ep_init = opt.last_epoch
-    _sfx = opt.dataset + '_epoch_' + str(ep_init)
-    _ckpt = os.path.join(opt.resume_dir, opt.dataset)
-    _backbone = getattr(opt, 'backbone', 'Resnet18')
+    ckpt = os.path.join(opt.resume_dir, opt.dataset)
+    sfx = f'{opt.dataset}_epoch_{ep_init}.pth'
     net_audiodepth = builder.build_audiodepth(
-        backbone=_backbone, mode="mat", audio_shape=opt.audio_shape,
-        weights=os.path.join(_ckpt, 'audiodepth_' + _sfx + '.pth'))
-    net_rgbdepth = builder.build_rgbdepth(
-        weights=os.path.join("checkpoints_pretrained", "rgbdepth_" + opt.dataset + ".pth"))
+        backbone=opt.backbone, mode='mat', audio_shape=opt.audio_shape,
+        weights=os.path.join(ckpt, 'audiodepth_' + sfx), **audiodepth_kwargs)
+    net_rgbdepth = builder.build_rgbdepth(weights=rgb_weights, **rgbdepth_kwargs)
     net_material = builder.build_material_property(init_weights=opt.init_material_weight)
     freeze_weights(net_material)
     if opt.freeze_nets:
         freeze_weights(net_rgbdepth)
-    ccl_audiodepth_net = builder.build_ccl(
-        head="DepthNet", input_dim=512, normalization_sign=False,
-        weights=os.path.join(_ckpt, 'ccl_audiodepth_' + _sfx + '.pth'))
-    ccl_audiomat_net = builder.build_ccl(
-        head="MatNet", input_dim=512, normalization_sign=False,
-        weights=os.path.join(_ckpt, 'ccl_audiomat_' + _sfx + '.pth'))
-    img_proj = builder.build_latent_proj_head(in_fc=512, out_fc=128)
-    aud_proj = builder.build_latent_proj_head(in_fc=512, out_fc=128)
+    ccl_audiodepth_net = builder.build_ccl(head='DepthNet', input_dim=512, use_film=opt.use_film_ce,
+                                           weights=os.path.join(ckpt, 'ccl_audiodepth_' + sfx))
+    ccl_audiomat_net = builder.build_ccl(head='MatNet', input_dim=512, use_film=opt.use_film_ce,
+                                         weights=os.path.join(ckpt, 'ccl_audiomat_' + sfx))
+    img_proj = builder.build_latent_proj_head(in_fc=512, out_fc=128, use_ln=opt.use_ln_proj)
+    aud_proj = builder.build_latent_proj_head(in_fc=512, out_fc=128, use_ln=opt.use_ln_proj)
 else:
-    print("Training Compositional Contrastive Learning...")
-    _backbone = getattr(opt, 'backbone', 'Resnet18')
-    _init_aud_wt = getattr(opt, 'init_audiodepth_weight', '')
     net_audiodepth = builder.build_audiodepth(
-        backbone=_backbone, mode="mat", audio_shape=opt.audio_shape, weights=_init_aud_wt)
-    if getattr(opt, 'use_se_skips', False):
-        net_audiodepth._use_se_skips = True
-    img_proj = builder.build_latent_proj_head(in_fc=512, out_fc=128)
-    aud_proj = builder.build_latent_proj_head(in_fc=512, out_fc=128)
-
-    if teacher_cache_path:
-        print("[INFO] Teacher cache enabled — teachers NOT loaded to GPU.")
-        net_rgbdepth = builder.build_rgbdepth()
-        net_material = builder.build_material_property(init_weights=opt.init_material_weight)
-        net_rgbdepth.cpu()
-        net_material.cpu()
+        backbone=opt.backbone, mode='mat', audio_shape=opt.audio_shape,
+        weights=opt.init_audiodepth_weight, **audiodepth_kwargs)
+    img_proj = builder.build_latent_proj_head(in_fc=512, out_fc=128, use_ln=opt.use_ln_proj)
+    aud_proj = builder.build_latent_proj_head(in_fc=512, out_fc=128, use_ln=opt.use_ln_proj)
+    if teacher_cache_path and opt.rgb_teacher == 'moge_v2':
+        net_rgbdepth = builder.build_rgbdepth(moge_cache_consumer_mode=True,
+                                              moge_cache_enc_dim_out=opt.moge_cache_enc_dim_out,
+                                              **rgbdepth_kwargs)
+    elif teacher_cache_path:
+        net_rgbdepth = builder.build_rgbdepth(**rgbdepth_kwargs)
         freeze_weights(net_rgbdepth)
-        freeze_weights(net_material)
     else:
-        net_rgbdepth = builder.build_rgbdepth(
-            weights=os.path.join("checkpoints_pretrained", "rgbdepth_" + opt.dataset + ".pth"))
-        net_material = builder.build_material_property(init_weights=opt.init_material_weight)
-        freeze_weights(net_material)
-        if opt.freeze_nets:
-            freeze_weights(net_rgbdepth)
+        net_rgbdepth = builder.build_rgbdepth(weights=rgb_weights, **rgbdepth_kwargs)
+    net_material = builder.build_material_property(init_weights=opt.init_material_weight)
+    freeze_weights(net_material)
+    if not teacher_cache_path and opt.freeze_nets:
+        freeze_weights(net_rgbdepth)
+    ccl_audiomat_net = builder.build_ccl(head='MatNet', input_dim=512, use_film=opt.use_film_ce,
+                                         n_class=opt.mat_nclass)
+    ccl_audiodepth_net = builder.build_ccl(head='DepthNet', input_dim=512, use_film=opt.use_film_ce)
 
-    ccl_audiomat_net = builder.build_ccl(head="MatNet", input_dim=512, normalization_sign=False)
-    ccl_audiodepth_net = builder.build_ccl(head="DepthNet", input_dim=512, normalization_sign=False)
-
-nets = (net_rgbdepth, net_audiodepth, net_material,
-        ccl_audiomat_net, ccl_audiodepth_net, img_proj, aud_proj)
+nets = (net_rgbdepth, net_audiodepth, net_material, ccl_audiomat_net, ccl_audiodepth_net, img_proj, aud_proj)
 
 dataloader = CustomDatasetDataLoader()
-dataloader.initialize(opt, teacher_cache_path=teacher_cache_path)
+dataloader.initialize(opt, teacher_cache_path=teacher_cache_path, material_cache_path=material_cache_path)
 dataset = dataloader.load_data()
 print(f'#training clips = {len(dataset)}')
 
 if opt.validation_on:
     opt.mode = 'val'
     if validation_cache_path and not os.path.exists(validation_cache_path):
-        print(f"[WARN] --validation_cache_path '{validation_cache_path}' not found")
+        print(f'[WARN] --validation_cache_path {validation_cache_path} not found')
         validation_cache_path = None
+    n_threads, opt.nThreads = opt.nThreads, 0
     dataloader_val = CustomDatasetDataLoader()
-    dataloader_val.initialize(opt, teacher_cache_path=validation_cache_path)
+    dataloader_val.initialize(opt, teacher_cache_path=validation_cache_path,
+                              material_cache_path=opt.validation_material_cache_path or None
+                              if validation_cache_path else None)
     dataset_val = dataloader_val.load_data()
     print(f'#validation clips = {len(dataloader_val)}')
+    if hasattr(getattr(dataset_val, 'dataset', None), '_orientations'):
+        from data_loader.audio_visual_dataset import preload_audio_for_dataset
+        preload_audio_for_dataset(dataset_val.dataset)
+    opt.nThreads = n_threads
     opt.mode = 'train'
 
+train = Trainer(nets, opt)
 total_steps = 0
-best_rmse = float("inf")
-_mp3d_budget = getattr(opt, 'dataset', 'replica') in (
-    'mp3d', 'mp3d_custom', 'mp3d_map', 'mp3d_map_odom_1m')
-TRAIN_TIME_BUDGET = 3600 if _mp3d_budget else 300
-_early_stop_patience = getattr(opt, 'early_stop_patience', 0)
-_no_improve_count = 0
-
-if getattr(opt, 'gradient_checkpointing', False):
-    net_audiodepth.enable_gradient_checkpointing()
-
-train = Trainer(nets, opt, augment=True)
-
-_train_start = time.time()
-_time_up = False
-_early_stopped = False
+best_rmse = best_rmse_valonly = float('inf')
+no_improve = 0
+early_stopped = False
 
 for epoch in range(ep_init, ep_init + opt.niter):
-    if _time_up or _early_stopped:
+    if early_stopped:
         break
     batch_loss = []
     for i, data in enumerate(dataset):
-        if TRAIN_TIME_BUDGET:
-            if time.time() - _train_start >= TRAIN_TIME_BUDGET:
-                print(f"[INFO] Training budget reached at epoch {epoch}, step {i}.")
-                _time_up = True
-                break
-        if _early_stopped:
+        if early_stopped:
             break
-
         total_steps += opt.batchSize
+        step = total_steps // opt.batchSize
         output, losses = train.forward(data)
-        step_loss, depth_loss, mat_loss, ccl_audiodepth_loss, ccl_audiomat_loss, \
-            loss_ct_ad, loss_ct_am, teacher_depth_loss = losses
+        del data, output
+        step_loss, depth_loss, mat_loss, ccl_ad_loss, ccl_am_loss, ct_ad_loss, ct_am_loss, td_loss = losses
         batch_loss.append(step_loss)
+        if step % 200 == 0:
+            gc.collect()
+            torch.cuda.empty_cache()
 
-        if total_steps // opt.batchSize % opt.display_freq == 0:
-            print(f'[Epoch {epoch}, Step {total_steps // opt.batchSize}]')
-            print(f"  depth_loss: {depth_loss:.4f}, mat_loss: {mat_loss}")
-            print(f"  ccl_depth: {ccl_audiodepth_loss}, ccl_mat: {ccl_audiomat_loss}")
-            print(f"  ct_ad: {loss_ct_ad}, ct_am: {loss_ct_am}")
-            print(f"  teacher_depth: {teacher_depth_loss}")
-
+        if step % opt.display_freq == 0:
+            print(f'[Epoch {epoch}, Step {step}]')
+            print(f'  depth_loss: {depth_loss:.4f}, mat_loss: {mat_loss:.4f}')
+            print(f'  ccl_depth: {ccl_ad_loss:.4f}, ccl_mat: {ccl_am_loss:.4f}')
+            print(f'  ct_ad: {ct_ad_loss:.4f}, ct_am: {ct_am_loss:.4f}')
+            print(f'  teacher_depth: {td_loss:.4f}')
+            if train.lambda_ldc > 0:
+                print(f"  ldc: {train.last['ldc']:.4f}")
+            if train.lambda_cc > 0:
+                print(f"  cc: {train.last['cc']:.4f}")
             avg_loss = sum(batch_loss) / len(batch_loss)
-            writer.add_images('train/audio_depth', output["audio_depth"], epoch, dataformats="NCHW")
-            writer.add_images('train/depth_gt', output["depth_gt"], epoch, dataformats="NCHW")
-            writer.add_scalar('train/avg_loss', avg_loss, epoch)
-            writer.add_scalar('train/depth_loss', depth_loss, epoch)
-
+            for k, v in (('avg_loss', avg_loss), ('depth_loss', depth_loss), ('mat_loss', mat_loss),
+                         ('ccl_audiodepth_loss', ccl_ad_loss), ('ccl_audiomat_loss', ccl_am_loss),
+                         ('teacher_depth_loss', td_loss), ('feat_std_loss', train.last['feat_std']),
+                         ('lr', train.optimizer.param_groups[0]['lr'])):
+                writer.add_scalar(f'train/{k}', v, step)
+            writer.flush()
             print(f'  avg_loss: {avg_loss:.5f}\n')
             batch_loss = []
 
-        if total_steps // opt.batchSize % opt.validation_freq == 0 and opt.validation_on:
+        if opt.validation_on and step % opt.validation_freq == 0:
             train.model.eval()
             opt.mode = 'val'
-            print(f'Validation at epoch {epoch}, step {total_steps // opt.batchSize}')
+            print(f'Validation at epoch {epoch}, step {step}')
             with train.swap_ema():
-                val_loss, val_err = evaluate(train, dataset_val, opt, writer, epoch)
-            writer.add_scalar('val/Loss', val_loss, epoch)
-            writer.add_scalar('val/RMSE', val_err["RMSE/STD"], epoch)
-
+                val_loss, val_err = evaluate(train, dataset_val, opt, writer, step,
+                                             max_batches=opt.val_max_batches or None)
+            writer.add_scalar('val/Loss', val_loss, step)
+            for k in ('RMSE', 'ABS_REL', 'DELTA1', 'DELTA2', 'DELTA3'):
+                writer.add_scalar(f'val/{k}', val_err[k], step)
+            writer.flush()
             train.model.train()
             opt.mode = 'train'
 
-            if train._plateau_scheduler and train.scheduler is not None:
-                _prev_lr = train.optimizer.param_groups[0]['lr']
-                train.scheduler.step(val_err['RMSE/STD'])
-                _new_lr = train.optimizer.param_groups[0]['lr']
-                if _new_lr < _prev_lr:
-                    print(f'[LR] {_prev_lr:.2e} -> {_new_lr:.2e}')
-
-            if val_err['RMSE/STD'] < best_rmse:
-                best_rmse = val_err['RMSE/STD']
-                _no_improve_count = 0
-                print(f'Best model (epoch {epoch}) RMSE: {val_err["RMSE/STD"]:.5f}\n')
+            best_net = train.ema_net if train.ema_net is not None else net_audiodepth
+            if val_err['RMSE'] < best_rmse:
+                best_rmse = val_err['RMSE']
+                no_improve = 0
+                print(f'Best model (epoch {epoch}) RMSE: {best_rmse:.5f}\n')
+                save_nets(opt, '', best_net, ccl_audiodepth_net, ccl_audiomat_net)
             else:
-                _no_improve_count += 1
-                if _early_stop_patience > 0 and _no_improve_count >= _early_stop_patience:
-                    print(f'[INFO] Early stopping (no improvement for '
-                          f'{_no_improve_count} checks). Best RMSE: {best_rmse:.5f}')
-                    _early_stopped = True
-                torch.save(net_audiodepth.state_dict(),
-                           os.path.join(opt.expr_dir, f'audiodepth_{opt.dataset}.pth'))
-                torch.save(ccl_audiodepth_net.state_dict(),
-                           os.path.join(opt.expr_dir, f'ccl_audiodepth_{opt.dataset}.pth'))
-                torch.save(ccl_audiomat_net.state_dict(),
-                           os.path.join(opt.expr_dir, f'ccl_audiomat_{opt.dataset}.pth'))
+                no_improve += 1
+                if 0 < opt.early_stop_patience <= no_improve:
+                    print(f'[INFO] Early stopping (no improvement for {no_improve} checks). Best RMSE: {best_rmse:.5f}')
+                    early_stopped = True
+            vo = val_err.get('RMSE_VALONLY')
+            if vo is not None and vo < best_rmse_valonly:
+                best_rmse_valonly = vo
+                print(f'Best val-only model (epoch {epoch}) RMSE: {vo:.5f}')
+                save_nets(opt, '_bestval', best_net, ccl_audiodepth_net, ccl_audiomat_net)
 
     if epoch % opt.epoch_save_freq == 0:
         print(f'Saving model at epoch {epoch}')
-        torch.save(net_audiodepth.state_dict(),
-                   os.path.join(opt.expr_dir, f'audiodepth_{opt.dataset}_epoch_{epoch}.pth'))
-        torch.save(ccl_audiodepth_net.state_dict(),
-                   os.path.join(opt.expr_dir, f'ccl_audiodepth_{opt.dataset}_epoch_{epoch}.pth'))
-        torch.save(ccl_audiomat_net.state_dict(),
-                   os.path.join(opt.expr_dir, f'ccl_audiomat_{opt.dataset}_epoch_{epoch}.pth'))
-
+        save_nets(opt, f'_epoch_{epoch}', net_audiodepth, ccl_audiodepth_net, ccl_audiomat_net)
+        cleanup_old_checkpoints(opt.expr_dir, opt.dataset)
     if opt.learning_rate_decrease_itr > 0 and epoch % opt.learning_rate_decrease_itr == 0:
         train.decrease_learning_rate(opt.decay_factor)
 
-# Final validation
+if opt.val_split_n > 0:
+    print(f'Saving last model (epoch {epoch})')
+    save_nets(opt, '_last', train.ema_net if train.ema_net is not None else net_audiodepth,
+              ccl_audiodepth_net, ccl_audiomat_net)
+
 if opt.validation_on:
     train.model.eval()
     opt.mode = 'val'
     print('Final validation:')
     with train.swap_ema():
-        val_loss, val_err = evaluate(train, dataset_val, opt, writer, epoch)
-    writer.add_scalar('val/Loss', val_loss, epoch)
+        val_loss, val_err = evaluate(train, dataset_val, opt, writer, total_steps // opt.batchSize)
+    writer.add_scalar('val/Loss', val_loss, total_steps // opt.batchSize)
     train.model.train()
     opt.mode = 'train'
-
 writer.close()

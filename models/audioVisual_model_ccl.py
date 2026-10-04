@@ -4,82 +4,83 @@ import torch.nn.functional as F
 
 
 class AudioVisualModel(torch.nn.Module):
-    """Cross-modal audio-visual model for CCL training.
-
-    Combines audio depth estimation with compositional contrastive learning
-    heads for material classification and depth alignment.
-    """
-
-    def name(self):
-        return 'AudioVisualModel'
-
-    def __init__(self, nets, opt, mode="depth"):
-        super(AudioVisualModel, self).__init__()
+    def __init__(self, nets, opt):
+        super().__init__()
         self.opt = opt
-        self.mode = mode
         self.net_rgbdepth, self.net_audio, self.net_material, \
             self.ccl_audiomat, self.ccl_audiodepth, self.img_proj, self.aud_proj = nets
+        self.ldc_head = None
+        if opt.lambda_ldc > 0:
+            self.ldc_head = nn.Sequential(nn.Linear(512, 256), nn.GELU(), nn.Linear(256, opt.ldc_grid ** 2))
+        self.cc_head = None
+        if opt.lambda_cc > 0:
+            self.cc_head = nn.Sequential(nn.Linear(512, 256), nn.GELU(), nn.Linear(256, 256 * 16))
 
     def forward(self, input, compute_ccl=True, compute_ct=True):
-        rgb_input = input['img']
-        audio_input = input['audio']
-        depth_gt = input['depth']
+        opt = self.opt
+        rgb = input['img']
+        audio_depth, audio_mat_class, audio_feat = self.net_audio(input['audio'])
+        dev = audio_feat.device
 
-        audio_depth, audio_mat_class, audio_feat = self.net_audio(audio_input)
+        need_mat = compute_ccl and (opt.lambda_ccl_depth + opt.lambda_ccl_mat) > 0
+        need_img_feat = need_mat or (compute_ct and opt.lambda_ct > 0)
+        need_img_depth = opt.lambda_teacher_depth > 0 or self.ldc_head is not None
 
-        _teacher_max = getattr(self.opt, 'teacher_max_depth', self.opt.max_depth)
-
-        # Use cached teacher features if available, otherwise run live inference
-        if 'img_feat' in input and 'material_feat' in input:
-            img_feat = input['img_feat'].to(audio_feat.device)
-            material_feat = input['material_feat'].to(audio_feat.device)
-            material_class = input['material_class_teacher'].to(audio_feat.device)
-            img_depth = input['img_depth'].to(audio_feat.device) if 'img_depth' in input else None
+        if ('enc_feat' in input or 'enc_feat_multi' in input or 'img_feat' in input) and 'material_feat' in input:
+            material_feat = input['material_feat'].to(dev) if need_mat else None
+            material_class = input['material_class_teacher'].to(dev) if need_mat else None
+            img_depth = input['img_depth'].to(dev) if (need_img_depth and 'img_depth' in input) else None
+            if not need_img_feat:
+                img_feat = None
+            elif 'enc_feat_multi' in input or 'enc_feat' in input:
+                key = 'enc_feat_multi' if 'enc_feat_multi' in input else 'enc_feat'
+                enc_feat = torch.nan_to_num(input[key].to(dev), nan=0.0, posinf=0.0, neginf=0.0)
+                if enc_feat.dim() == 5:
+                    enc_feat = enc_feat.sum(1)
+                enc_feat = F.interpolate(enc_feat, size=getattr(self.net_rgbdepth, 'feat_hw', (4, 4)),
+                                         mode='bilinear', align_corners=False)
+                img_feat = self.net_rgbdepth.feat_proj(enc_feat)
+            else:
+                img_feat = input['img_feat'].to(dev)
         else:
-            with torch.no_grad():
-                img_depth, img_feat = self.net_rgbdepth(rgb_input)
-                material_class, material_feat = self.net_material(rgb_input)
+            rgb_trainable = any(p.requires_grad for p in self.net_rgbdepth.parameters())
+            if not (rgb_trainable or compute_ccl or compute_ct or opt.lambda_teacher_depth > 0):
+                img_depth = img_feat = None
+                material_class = material_feat = None
+                if need_mat:
+                    with torch.no_grad():
+                        material_class, material_feat = self.net_material(rgb)
+            else:
+                with torch.set_grad_enabled(rgb_trainable and torch.is_grad_enabled()):
+                    img_depth, img_feat = self.net_rgbdepth(rgb)
+                with torch.no_grad():
+                    material_class, material_feat = self.net_material(rgb)
 
-        # CCL branches (stop-gradient on backbone)
+        ccl_audiomat = ccl_audiodepth = ccl_audiodepth_feat = None
         if compute_ccl:
-            audio_feat_ccl = audio_feat.detach().expand(
-                -1, -1, img_feat.shape[-2], img_feat.shape[-1]).contiguous()
-            ccl_audiomat, ccl_mat_feat = self.ccl_audiomat(
-                audio_feat_ccl, material_feat.detach())
-            ccl_audiodepth, ccl_audiodepth_feat = self.ccl_audiodepth(
-                audio_feat_ccl, img_feat.detach())
-        else:
-            ccl_audiomat = ccl_mat_feat = ccl_audiodepth = ccl_audiodepth_feat = None
+            audio_feat_ccl = audio_feat.expand(-1, -1, img_feat.shape[-2], img_feat.shape[-1]).contiguous()
+            ccl_audiomat, _ = self.ccl_audiomat(audio_feat_ccl, material_feat.detach())
+            ccl_audiodepth, ccl_audiodepth_feat = self.ccl_audiodepth(audio_feat_ccl, img_feat.detach())
 
-        # Contrastive projection heads
+        aud_proj_feat = img_proj_feat = None
         if compute_ct:
-            aud_proj_feat = self.aud_proj(
-                F.adaptive_avg_pool2d(audio_feat, (1, 1)))
-            img_proj_feat = self.img_proj(
-                F.adaptive_avg_pool2d(img_feat.detach(), (1, 1)))
-        else:
-            aud_proj_feat = img_proj_feat = None
+            aud_proj_feat = self.aud_proj(audio_feat.mean((2, 3), keepdim=True))
+            img_proj_feat = self.img_proj(img_feat.detach().mean((2, 3), keepdim=True))
 
-        # Scale teacher output to meters
-        if img_depth is not None:
-            img_depth_m = (img_depth * _teacher_max).clamp(0, self.opt.max_depth)
-        else:
-            img_depth_m = None
-
-        output = {
-            'img_depth': img_depth_m,
+        return {
+            'img_depth': (img_depth * opt.max_depth).clamp(0, opt.max_depth) if img_depth is not None else None,
             'img_feat': img_feat,
-            'audio_depth': audio_depth * self.opt.max_depth,
+            'audio_depth': audio_depth * opt.max_depth,
             'audio_mat_class': audio_mat_class,
             'audio_feat': audio_feat,
             'ccl_audiomat': ccl_audiomat,
-            'ccl_audiomat_feat': ccl_mat_feat,
-            'ccl_audiodepth': ccl_audiodepth * self.opt.max_depth if ccl_audiodepth is not None else None,
+            'ccl_audiodepth': ccl_audiodepth * opt.max_depth if ccl_audiodepth is not None else None,
             'ccl_audiodepth_feat': ccl_audiodepth_feat,
             'material_class': material_class,
             'material_feat': material_feat,
             'aud_proj_feat': aud_proj_feat,
             'img_proj_feat': img_proj_feat,
-            'depth_gt': depth_gt,
+            'ldc_emb': self.ldc_head(audio_feat.float().flatten(2).mean(2)) if self.ldc_head is not None else None,
+            'cc_emb': self.cc_head(audio_feat.float().flatten(2).mean(2)) if self.cc_head is not None else None,
+            'depth_gt': input['depth'],
         }
-        return output
